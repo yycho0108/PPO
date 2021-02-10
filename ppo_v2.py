@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 
-
 import numpy as np
 import gym
 import itertools
 import time
+import importlib
 from functools import partial
 from pathlib import Path
+from dataclasses import dataclass, field, replace, asdict
+from simple_parsing import ArgumentParser
+import argcomplete
+from typing import List, Tuple, Dict
 
 import torch as th
 import torch.nn as nn
@@ -15,69 +19,86 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from torch.utils.tensorboard.writer import SummaryWriter
 
-from dataclasses import dataclass, field, replace, asdict
-from simple_parsing import ArgumentParser
-import argcomplete
-
-from typing import List, Tuple, Dict
-
 from subproc import subproc
 from multi_env import MultiEnv
 from ring_buffer import ContiguousRingBuffer
-# from phonebot.sim.pybullet.simulator import PybulletPhonebotEnv, PybulletSimulatorSettings
 
 
 @dataclass
 class AcSettings:
-    encoder_pi: List[int] = field(default_factory=lambda: [64, 64])
-    encoder_v: List[int] = field(default_factory=lambda: [64, 64])
-    activation_fn: nn.Module = nn.Tanh
-    log_std_init: float = 0.0
-    ortho_init: bool = True
+    """ Actor-Critic Policy Network Settings """
+    # policy feature mlp layout
+    encoder_pi: List[int] = field(
+        default_factory=lambda: [
+            64, 64])
+    # value feature mlp layout
+    encoder_v: List[int] = field(
+        default_factory=lambda: [
+            64, 64])
+    activation_fn: nn.Module = nn.Tanh  # activation for encoders
+    log_std_init: float = 0.0  # initial value for log(std(action_dist))
+    ortho_init: bool = True  # use orthogonal initialization.
 
 
 @dataclass
 class GaeSettings:
-    gamma: float = 0.999
-    lmbda: float = 0.98
+    """ Generalized Advantage Estimation Settings """
+    gamma: float = 0.999  # discounted rewards gamma.
+    lmbda: float = 0.98  # generalized advantage estimation lambda>
 
 
 @dataclass
 class PpoSettings:
-    eps: float = 0.2  # clipping epsilon
-    clip_range: float = 0.2
+    """ PPO Settings """
+    eps: float = 0.2  # clipping epsilon.
+    clip_range: float = 0.2  # policy clipping.
 
-    entropy_weight: float = 0.01
-    value_weight: float = 0.5
-    max_grad_norm: float = 0.5
+    entropy_weight: float = 0.01  # coef for entropy loss>
+    value_weight: float = 0.5  # coef for value loss.
+    max_grad_norm: float = 0.5  # gradient clipping.
+
+    adam_lr: float = 2.5e-4  # adam learning rate.
+    adam_eps: float = 1e-5  # adam epsilon.
 
 
 @dataclass
 class Settings:
+    """ Overall App Settings, currently """
     ac: AcSettings = AcSettings()
     gae: GaeSettings = GaeSettings()
     ppo: PpoSettings = PpoSettings()
-    num_envs: int = 16
-    device: str = 'cuda'
-    batch_size: int = 64
 
-    max_steps: int = 5e6
-    update_steps: int = 1024
-    save_steps: int = 1e5
-    num_epochs: int = 4  # ppo-style train epochs
+    env_id: str = 'LunarLanderContinuous-v2'  # env to use for train/test
+    imports: Tuple[str, ...] = ()  # required packages for (usually) env
 
-    # exponential decay param for reward distribution estimation
-    reward_normalizer_alpha: float = 0.001
-    # exponential decay param for state distribution estimation
-    state_normalizer_alpha: float = 0.001
+    num_envs: int = 16  # number of envs to use in parallel
+    device: str = 'cuda'  # which device to use for training
+    batch_size: int = 64  # batch size for training
 
-    train: bool = True
-    model_path: str = '/tmp/model.zip'
-    ckpt_path: str = '/tmp/ppo-ckpt'
-    subproc: bool = True  # only used if `train`
+    max_steps: int = 2e6  # max number of steps to run the training.
+    update_steps: int = 1024  # model update period, memory=num_envs*update_steps
+    save_steps: int = 1e5  # model saving period
+    num_epochs: int = 4  # ppo-style train epochs on current rollout buffer
+
+    # exponential decay param for reward distribution estimation.
+    reward_normalizer_alpha: float = 0.01
+    # exponential decay param for state distribution estimation.
+    state_normalizer_alpha: float = 0.01
+
+    train: bool = True  # Whether to train (otherwise run test())
+    model_path: str = '/tmp/model.zip'  # Model path of trained agent
+    ckpt_path: str = '/tmp/ppo-ckpt'   # Checkpoint path for saving
+    subproc: bool = True  # Run envs in subprocess, only used if `train`.
+
+    # Use dist.mode() instead of dist.sample() during test.
+    deterministic_test: bool = True
 
 
 def pairwise(iterable):
+    """
+    Adjacent pairs from an iterable.
+    Taken from https://docs.python.org/3/library/itertools.html
+    """
     a, b = itertools.tee(iterable)
     next(b, None)
     return zip(a, b)
@@ -94,6 +115,9 @@ def gae(memory: ContiguousRingBuffer, last_values: np.ndarray,
     to compute the advantage. To obtain vanilla advantage (A(s) = R - V(S))
     where R is the discounted reward with value bootstrap,
     set ``gae_lambda=1.0`` during initialization.
+
+    NOTE(ycho): Copied nearly verbatim from stable_baselines3.
+    @see RolloutBuffer.compute_returns_and_advantages().
     """
     last_gae_lam = 0
     n = len(memory)
@@ -153,6 +177,9 @@ class AC(nn.Module):
         # NOTE(ycho): Orthogonal initialization...
         # apparently quite important???
         if opts.ortho_init:
+            # FIXME(ycho): Copied verbatim from the reference implementation.
+            # Perhaps refer the associated paper for explanation.
+            # Also, remove the hardcode values.
             gains = {
                 self.encoder_pi: np.sqrt(2),
                 self.encoder_v: np.sqrt(2),
@@ -203,6 +230,10 @@ class AC(nn.Module):
 
 
 class PPO:
+    """
+    Proximal Policy Optimization implementation.
+    """
+
     def __init__(self, policy: AC, memory: ContiguousRingBuffer,
                  device: th.device, opts: PpoSettings):
         self.policy = policy
@@ -211,8 +242,8 @@ class PPO:
         self.opts = opts
 
         self.optimizer = th.optim.Adam(policy.parameters(),
-                                       lr=2.5e-4,
-                                       eps=1e-5)
+                                       lr=opts.adam_lr,
+                                       eps=opts.adam_eps)
 
     def act(self, states: np.ndarray, train: bool = True,
             deterministic: bool = None):
@@ -290,13 +321,17 @@ class ExponentialMovingGaussian(object):
     """
 
     def __init__(self, alpha=0.01, eps=1e-8):
+        # Save params to self scope.
         self.alpha = alpha
         self.eps = eps
+
+        # Reset stats.
         self.mean = 0.0
         self.var = 0.0
         self.count = 0
 
     def add(self, value: np.ndarray):
+        """ record a value entry for stats accumulation. """
         if self.count == 0:
             self.mean = np.copy(value)
             self.var = np.zeros_like(value)
@@ -308,16 +343,21 @@ class ExponentialMovingGaussian(object):
             self.var = (1 - alpha) * (self.var + diff * incr)
         self.count += 1
 
-    def normalize(self, value: np.ndarray):
+    def normalize(self, value: np.ndarray) -> np.ndarray:
+        """ normalize `value` distribution to 0 mean, 1 std. """
         std = np.sqrt(self.var)
         if self.count == 0 or np.equal(std, 0).any():
             return value
         return (value - self.mean) / (std + self.eps)
 
     def reset(self):
+        # NOTE(ycho): other stats can be left as-is,
+        # since mean/var are auto initialized on first invocation
+        # of self.add().
         self.count = 0
 
-    def params(self):
+    def params(self) -> Dict[str, float]:
+        """ Return stats params. """
         return {
             'mean': self.mean,
             'var': self.var,
@@ -325,18 +365,28 @@ class ExponentialMovingGaussian(object):
         }
 
     def load(self, params):
+        """
+        Load statistics from input parameters.
+        @see `ExponentialMovingGaussian.params()` for format.
+        """
         self.mean = params['mean']
         self.var = params['var']
         self.count = params['count']
 
 
 class Callback(object):
+    """
+    Base class for periodic callbacks.
+    """
+
     def __init__(self, period: int, callback):
         self.period = period
         self.last_call = 0
         self.callback = callback
 
     def on_step(self, step: int):
+        # NOTE(ycho): Don't use (step % self.period) which is common,
+        # since if `num_env` != 0, lcm(period, num_env) may not be period.
         if step < self.last_call + self.period:
             return
         self.callback(step)
@@ -344,6 +394,10 @@ class Callback(object):
 
 
 class SaveCallback(Callback):
+    """
+    Periodically save all parameters retrieved over a nullary function.
+    """
+
     def __init__(self, period: int, ckpt_path: str, data_fn):
         ckpt_path = Path(ckpt_path)
         if not ckpt_path.exists():
@@ -353,23 +407,33 @@ class SaveCallback(Callback):
         super().__init__(period, self._save)
 
     def _save(self, step: int):
-        print('saving ... @ {}'.format(step))
         out_file = self.ckpt_path / 'model-{:05d}.zip'.format(step)
+        print('saving to {} @ {}'.format(str(out_file), step))
         th.save(self.data_fn(), str(out_file))
+
+
+def gym_make(imports: List[str], *args, **kwargs):
+    """
+    gym.make() but it also works in a subprocess
+    by importing the necessary packages internally.
+    """
+    for pkg in imports:
+        importlib.import_module(pkg)
+    return gym.make(*args, **kwargs)
 
 
 def train(opts: Settings):
     # === INSTANTIATE ENVIRONMENT ===
+    # gym.make() but with imports configured as specified in arg.
+    _gym_make = partial(gym_make, opts.imports)
+    subproc_gym_make = subproc(_gym_make)
 
     # If `opts.subproc==True`, invoke gym.make() in a subprocess,
     # and treat the resultant instance as a `gym.Env`.
-    subproc_gym_make = subproc(gym.make)
-    gym_make = subproc_gym_make if opts.subproc else gym.make
+    make_env = subproc_gym_make if opts.subproc else _gym_make
 
     def get_env(index: int):
-        env = gym_make('LunarLanderContinuous-v2')
-        # env = gym.make('MountainCarContinuous-v0')
-        # env = gym.make('LunarLanderContinuous-v2')
+        env = make_env(opts.env_id)
         env.seed(index)
         env.reset()
         return env
@@ -416,8 +480,9 @@ def train(opts: Settings):
     returns = np.zeros(opts.num_envs, dtype=np.float32)
 
     # === LOGGER ===
+    # TODO(ycho): Configure logger
     writer = SummaryWriter()
-    writer.add_graph(policy, th.as_tensor(states).to(device))
+    writer.add_graph(policy, th.as_tensor(states).float().to(device))
 
     # === CALLBACKS ===
     save_cb = SaveCallback(
@@ -493,6 +558,8 @@ def train(opts: Settings):
             writer.add_scalar(
                 'fps', step / (time.time() - start_time), global_step=step)
 
+            # NOTE(ycho): Don't rely on printed reward stats for tracking
+            # training progress ... use tensorboard instead.
             print('== step {} =='.format(step))
             # Log reward before overwriting with normalized values.
             print('rew = mean {} min {} max {} std {}'.format(
@@ -594,10 +661,15 @@ def train(opts: Settings):
         'state_normalizer': state_normalizer.params()
     }, opts.model_path)
 
+    # TODO(ycho): Deal with the fact that with subproc,
+    # Ctrl+C does not (apparently) fully terminate the process.
+    # Wonder what might be left dangling??
+
 
 def test(opts: Settings):
     # == CREATE ENV ===
-    env = gym.make('LunarLanderContinuous-v2')
+    _gym_make = partial(gym_make, opts.imports)
+    env = _gym_make(opts.env_id)
 
     # === NORMALIZE INPUTS ===
     state_normalizer = ExponentialMovingGaussian()
@@ -639,7 +711,7 @@ def test(opts: Settings):
         env.render()
         state = np.asarray(state).astype(np.float32)
         state = state_normalizer.normalize(state)
-        action = ppo.act(state, False, True)
+        action = ppo.act(state, False, opts.deterministic_test)
 
         clipped_action = np.clip(
             action, env.action_space.low, env.action_space.high)
